@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 // Constants for the ring buffer
 const SIZE: usize = 256;
