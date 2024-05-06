@@ -19,7 +19,7 @@ struct QueueingPort {
     message_count: usize,
 }
 
-impl QueueingPort {
+impl QueueingPort {        
     fn new() -> QueueingPort {
         QueueingPort {
             buffer: [0; SIZE * MSGS],
@@ -66,4 +66,22 @@ impl QueueingPort {
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
+}
+
+// Unit tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enqueue_dequeue_test() {
+        let mut qp = QueueingPort::new();
+        let message = Message([1; SIZE]);
+        
+        assert!(qp.enqueue(message).is_ok(), "Enqueue is successful");
+        let result = qp.dequeue();
+        
+        assert!(result.is_some(), "Dequeue returning some message");
+        assert_eq!(result.unwrap().0, [1; SIZE], "Dequeued message should match the enqueued message");
+    }
 }
