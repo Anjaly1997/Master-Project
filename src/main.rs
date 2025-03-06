@@ -1,44 +1,50 @@
 #![no_std]
 
+extern crate alloc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::cell::UnsafeCell;
+use alloc::sync::Arc;
+use spin::Mutex;
+use core::thread;
+use core::time::Duration;
+use shared_memory::{Shmem, ShmemConf};
 
-// Constants for the size of each message and the maximum number of messages.
+
 const SIZE: usize = 256;
 const MSGS: usize = 10;
 
-// Static buffer representing shared memory in `no_std` environment.
-static mut SHARED_BUFFER: [u8; SIZE * MSGS] = [0; SIZE * MSGS];
-
-// Ring buffer queue using atomic operations for thread-safe access.
+// Thread-safe ring buffer queue using atomic operations
 struct QueueingPort {
-    buffer: &'static mut [u8; SIZE * MSGS],   // Shared memory buffer.
-    write_index: AtomicUsize,                // Index for writing the next message.
-    read_index: AtomicUsize,                 // Index for reading the next message.
-    message_count: AtomicUsize,              // Keeps track of the number of messages in the queue.
+    buffer: &'static mut [u8; SIZE * MSGS], 
+    write_index: AtomicUsize,              
+    read_index: AtomicUsize,               
+    message_count: AtomicUsize,             
 }
 
 #[derive(Debug)]
 enum QueueError {
-    FullBuffer,   // Returned when trying to enqueue into a full queue.
-    EmptyBuffer,  // Returned when trying to dequeue from an empty queue.
+    FullBuffer,   // Returned when trying to enqueue into a full queue
+    EmptyBuffer,  // Returned when trying to dequeue from an empty queue
 }
 
-#[derive(Debug)]
-struct Message([u8; SIZE]); 
+#[derive(Debug, Clone, Copy)]
+struct Message([u8; SIZE]);
 
 impl QueueingPort {
-    // Initializes a new queue with shared memory.
+    // Initializes a new queue in shared memory
     fn new() -> Self {
+        let shmem = ShmemConf::new().size(SIZE * MSGS).create().unwrap();
+        let buffer = unsafe { &mut *(shmem.as_ptr() as *mut [u8; SIZE * MSGS]) };
+
         QueueingPort {
-            buffer: unsafe { &mut SHARED_BUFFER },  // Accesses shared memory buffer.
+            buffer, 
             write_index: AtomicUsize::new(0),
             read_index: AtomicUsize::new(0),
             message_count: AtomicUsize::new(0),
         }
     }
 
-    // Enqueues a message into the buffer.
+    // Enqueues a message into the buffer
     fn enqueue(&mut self, message: Message) -> Result<(), QueueError> {
         if self.message_count.load(Ordering::SeqCst) >= MSGS {
             return Err(QueueError::FullBuffer);
@@ -50,13 +56,12 @@ impl QueueingPort {
             self.buffer[start + i] = message.0[i];
         }
 
-        // Updates write index and increments the message count.
         self.write_index.store((write_index + 1) % MSGS, Ordering::SeqCst);
         self.message_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
-    // Dequeues a message from the buffer.
+    // Dequeues a message from the buffer
     fn dequeue(&mut self) -> Result<Message, QueueError> {
         if self.message_count.load(Ordering::SeqCst) == 0 {
             return Err(QueueError::EmptyBuffer);
@@ -69,52 +74,82 @@ impl QueueingPort {
             msg_array[i] = self.buffer[start + i];
         }
 
-        // Updates read index and decrements the message count.
         self.read_index.store((read_index + 1) % MSGS, Ordering::SeqCst);
         self.message_count.fetch_sub(1, Ordering::SeqCst);
         Ok(Message(msg_array))
     }
 }
 
-// Simulated shared memory between "threads" in `no_std` using UnsafeCell.
-struct Shared<T> {
-    inner: UnsafeCell<T>,
-}
+// Thread-safe queue using `spin::Mutex`
+static QUEUE: Mutex<QueueingPort> = Mutex::new(QueueingPort::new());
 
-unsafe impl<T> Sync for Shared<T> {}
+// Multi-Threading 
 
-// Global queue shared between two simulated "threads".
-static QUEUE: Shared<QueueingPort> = Shared {
-    inner: UnsafeCell::new(QueueingPort::new()),
-};
-
-// Simulated writer thread.
-fn write_thread() {
-    let queue = unsafe { &mut *QUEUE.inner.get() };
-
-    for i in 0..5 {
+// Writer thread function
+fn writer(queue: Arc<Mutex<QueueingPort>>) {
+    for i in 0..10 {
         let message = Message([i as u8; SIZE]);
-        queue.enqueue(message).ok();  // Ignore errors for simplicity.
+        let mut queue = queue.lock();
+        if queue.enqueue(message).is_err() {
+            println!("Queue full, skipping message");
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
-// Simulated reader thread.
-fn read_thread() {
-    let queue = unsafe { &mut *QUEUE.inner.get() };
-
-    for _ in 0..5 {
-        queue.dequeue().ok();  // Ignore errors for simplicity.
+// Reader thread function
+fn reader(queue: Arc<Mutex<QueueingPort>>) {
+    for _ in 0..10 {
+        let mut queue = queue.lock();
+        if let Ok(msg) = queue.dequeue() {
+            assert_eq!(msg.0[0], 0); 
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
-// Panic handler for `no_std` environments.
+// Panic handler for `no_std`
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-// Main function simulates both writer and reader accessing the shared queue.
-fn main() {
-    write_thread();  // Simulate writing messages.
-    read_thread();   // Simulate reading messages.
+//  Unit Tests 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use spin::Mutex;
+    use core::thread;
+    use core::sync::atomic::AtomicBool;
+    use core::time::Duration;
+
+    #[test]
+    fn test_concurrent_read_write() {
+        let queue = Arc::new(Mutex::new(QueueingPort::new()));
+        let writer_queue = Arc::clone(&queue);
+        let reader_queue = Arc::clone(&queue);
+
+        let writer_thread = thread::spawn(move || {
+            for i in 0..10 {
+                let message = Message([i as u8; SIZE]);
+                let mut queue = writer_queue.lock();
+                queue.enqueue(message).ok(); 
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let reader_thread = thread::spawn(move || {
+            for _ in 0..10 {
+                let mut queue = reader_queue.lock();
+                if let Ok(msg) = queue.dequeue() {
+                    assert_eq!(msg.0[0], 0); 
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        writer_thread.join().unwrap();
+        reader_thread.join().unwrap();
+    }
 }
